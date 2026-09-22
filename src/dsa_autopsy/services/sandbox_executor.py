@@ -916,6 +916,70 @@ def make_safe(val):
     except Exception:
         return str(type(val))
 
+__trace_frames__ = []
+__step_count__ = 0
+
+def __record_trace__(lineno, local_vars, instruction):
+    global __step_count__
+    __step_count__ += 1
+    if __step_count__ > {self.max_steps}:
+        raise RuntimeError("Instruction limit exceeded")
+
+    clean_vars = {{k: v for k, v in local_vars.items() if not k.startswith("__")}}
+    __trace_frames__.append({{
+        "line_number": lineno,
+        "local_variables": make_safe(clean_vars),
+        "instruction": instruction
+    }})
+
+class TraceInjector(ast.NodeTransformer):
+    def __init__(self, target_func):
+        self.target_func = target_func
+        self.in_target = False
+
+    def visit_FunctionDef(self, node):
+        is_target = not self.target_func or node.name == self.target_func
+        old_in_target = self.in_target
+        if is_target:
+            self.in_target = True
+
+        self.generic_visit(node)
+
+        self.in_target = old_in_target
+        return node
+
+    def generic_visit(self, node):
+        super().generic_visit(node)
+
+        for field in ['body', 'orelse', 'finalbody']:
+            if hasattr(node, field):
+                old_body = getattr(node, field)
+                if isinstance(old_body, list):
+                    new_body = []
+                    for stmt in old_body:
+                        if (self.in_target and hasattr(stmt, 'lineno')
+                            and not isinstance(stmt, (ast.Global, ast.Nonlocal))):
+                            track_call = ast.Expr(
+                                value=ast.Call(
+                                    func=ast.Name(id='__record_trace__', ctx=ast.Load()),
+                                    args=[
+                                        ast.Constant(value=stmt.lineno),
+                                        ast.Call(
+                                            func=ast.Name(id='locals', ctx=ast.Load()),
+                                            args=[], keywords=[]
+                                        ),
+                                        ast.Constant(value=self.target_func or "module")
+                                    ],
+                                    keywords=[]
+                                )
+                            )
+                            ast.copy_location(track_call, stmt)
+                            ast.fix_missing_locations(track_call)
+                            new_body.append(track_call)
+                        new_body.append(stmt)
+                    setattr(node, field, new_body)
+        return node
+
 def find_entry_point(code_content):
     try:
         tree = ast.parse(code_content)
@@ -969,9 +1033,14 @@ def run_sandbox():
             raise PermissionError(f"Importing module '{{name}}' is disabled in the sandbox.")
         return original_import(name, globals, locals, fromlist, level)
 
-    namespace = {{}}
+    namespace = {{
+        "__record_trace__": __record_trace__
+    }}
     try:
-        compiled_code = compile(code_content, code_path, "exec")
+        tree = ast.parse(code_content, code_path)
+        tree = TraceInjector(func_name).visit(tree)
+        ast.fix_missing_locations(tree)
+        compiled_code = compile(tree, code_path, "exec")
     except Exception as e:
         result = {{
             "stdout": "",
@@ -1091,38 +1160,7 @@ def run_sandbox():
             json.dump(result, f)
         sys.exit(0)
 
-    trace_frames = []
-    step_count = 0
-    max_steps = {self.max_steps}
-
-    def trace_lines(frame, event, arg):
-        nonlocal step_count
-        try:
-            if event == 'line':
-                step_count += 1
-                if step_count > max_steps:
-                    sys.settrace(None)
-                    frame.f_trace = None
-                    raise RuntimeError("Instruction limit exceeded")
-
-                local_vars = {{k: v for k, v in frame.f_locals.items() if not k.startswith("__")}}
-                trace_frames.append({{
-                    "line_number": frame.f_lineno,
-                    "local_variables": make_safe(local_vars),
-                    "instruction": frame.f_code.co_name
-                }})
-        except BaseException as e:
-            sys.settrace(None)
-            frame.f_trace = None
-            if isinstance(e, RuntimeError) and "Instruction limit exceeded" in str(e):
-                raise
-        return trace_lines
-
-    def trace_calls(frame, event, arg):
-        if event == 'call':
-            if frame.f_code.co_filename == code_path:
-                return trace_lines
-        return None
+    # No trace frames setup needed here, handled by AST globally
 
     target_callable = None
     if class_name:
@@ -1157,21 +1195,17 @@ def run_sandbox():
     builtins.open = original_open
 
     start_time = time.perf_counter()
-    sys.settrace(trace_calls)
     try:
         builtins.open = blocked_action
         return_val = target_callable(**inputs)
-        sys.settrace(None)
-        if trace_frames:
-            trace_frames[-1]["local_variables"]["return_value"] = make_safe(return_val)
+        if __trace_frames__:
+            __trace_frames__[-1]["local_variables"]["return_value"] = make_safe(return_val)
     except BaseException as e:
-        sys.settrace(None)
         builtins.open = original_open
         exit_code = 1
         error_message = f"Runtime Exception: {{type(e).__name__}}: {{str(e)}}"
         captured_stderr.write(traceback.format_exc())
     finally:
-        sys.settrace(None)
         builtins.open = original_open
         end_time = time.perf_counter()
 
@@ -1183,7 +1217,7 @@ def run_sandbox():
         "stderr": captured_stderr.getvalue(),
         "exit_code": exit_code,
         "execution_time_seconds": end_time - start_time,
-        "trace_frames": trace_frames,
+        "trace_frames": __trace_frames__,
         "error_message": error_message
     }}
 
